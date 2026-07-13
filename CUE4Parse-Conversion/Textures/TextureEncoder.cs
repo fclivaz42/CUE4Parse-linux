@@ -7,6 +7,7 @@ using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Objects.Core.Math;
 using OffiUtils;
 using SkiaSharp;
+using Serilog;
 
 namespace CUE4Parse_Conversion.Textures;
 
@@ -38,7 +39,10 @@ public static class TextureEncoder
             }
             case ETextureFormat.Tga:
                 ext = "tga";
-                return EncodeTga(bitmap);
+                return EncodeTga(in bitmap, false);
+            case ETextureFormat.Tgac:
+                ext = "tgac";
+                return EncodeTga(in bitmap, true);
             default:
                 ext = "unk";
                 return [];
@@ -46,7 +50,36 @@ public static class TextureEncoder
         }
     }
 
-    private static byte[] EncodeTga(CTexture bitmap)
+	private unsafe static void GetTGABitdepth(in SKBitmap image, byte* ptr)
+	{
+		byte *bitdepth = &ptr[0];
+		byte *metadata = &ptr[1];
+
+		// TGA supports top-down pixel layout as long as you set the 5th metadata bit to 1.
+		// Since this makes the iterations easier, this is what we do.
+		*metadata = 0b00100000;
+
+		for (int y = 0; y < image.Height && (*metadata & 8) == 0; y++)
+			for (int x = 0; x < image.Width && (*metadata & 8) == 0; x++)
+				if (image.GetPixel(x, y).Alpha != 0x000000ff)
+					*metadata |= 8;
+
+		switch (image.ColorType)
+		{
+			case SKColorType.Bgra8888:
+			case SKColorType.Rgba8888:
+				if ((*metadata & 8) != 0)
+					*bitdepth = 32;
+				else
+					*bitdepth = 24;
+				break;
+			case SKColorType.Gray8:
+				*bitdepth = 8;
+				break;
+		}
+	}
+
+    private static byte[] EncodeTga(in CTexture bitmap, bool compress)
     {
         using var skBitmap = bitmap.ToSkBitmap();
         int width = skBitmap.Width;
@@ -57,29 +90,31 @@ public static class TextureEncoder
         byte[] output = new byte[totalSize];
 
         //TGA header
-        output[2] = 2; // Uncompressed
+        output[2]  = (byte)(compress? 10 : 2); // 10 is RGB + RLE, aka RLE-encoded RGB data. 2 is raw RGB.
         output[12] = (byte)(width & 0xFF);
         output[13] = (byte)(width >> 8);
         output[14] = (byte)(height & 0xFF);
         output[15] = (byte)(height >> 8);
-        output[16] = 32; // 32-bit
-        output[17] = 8;  // 8 bits of alpha
 
         unsafe
         {
             fixed (byte* ptr = output)
             {
-                byte* pixelPtr = ptr + 18; //Start writing after header
+				GetTGABitdepth(in skBitmap, ptr + 16);
+				Log.Information($"Bitmap: {output[16]}, mask: {output[17]}");
+                byte* pixelPtr = ptr + 18;
 
-                for (int y = height - 1; y >= 0; y--)//TGA stores pixels bottom-up
+                for (int y = 0; y < height; y++)
                 {
                     for (int x = 0; x < width; x++)
                     {
                         var color = skBitmap.GetPixel(x, y);
+						var colors = skBitmap.GetPixels();
                         *pixelPtr++ = color.Blue;
                         *pixelPtr++ = color.Green;
                         *pixelPtr++ = color.Red;
-                        *pixelPtr++ = color.Alpha;
+						if ((output[17] & 8) != 0)
+							*pixelPtr++ = color.Alpha;
                     }
                 }
             }
